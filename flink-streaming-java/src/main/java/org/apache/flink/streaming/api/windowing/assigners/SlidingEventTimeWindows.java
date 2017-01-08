@@ -114,4 +114,9 @@ public class SlidingEventTimeWindows extends WindowAssigner<Object, TimeWindow> 
 	public boolean isEventTime() {
 		return true;
 	}
+
+	@Override
+	public TimeWindow assignPane(long start, long end) {
+		return new TimeWindow(start, end);
+	}
 }

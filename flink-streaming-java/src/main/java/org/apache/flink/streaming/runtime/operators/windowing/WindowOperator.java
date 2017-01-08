@@ -51,9 +51,11 @@ import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.operators.TimestampedCollector;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.api.windowing.assigners.MergingWindowAssigner;
+import org.apache.flink.streaming.api.windowing.assigners.SlidingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.assigners.WindowAssigner;
 import org.apache.flink.streaming.api.windowing.triggers.Trigger;
 import org.apache.flink.streaming.api.windowing.triggers.TriggerResult;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.api.windowing.windows.Window;
 import org.apache.flink.streaming.runtime.operators.Triggerable;
 import org.apache.flink.streaming.runtime.operators.windowing.functions.InternalWindowFunction;
@@ -64,12 +66,14 @@ import org.apache.flink.util.Preconditions;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.Serializable;
-import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.PriorityQueue;
+import java.util.HashSet;
 import java.util.Set;
+import java.util.Collection;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ScheduledFuture;
 
 import static java.util.Objects.requireNonNull;
@@ -114,6 +118,7 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 	protected final Trigger<? super IN, ? super W> trigger;
 
 	protected final StateDescriptor<? extends AppendingState<IN, ACC>, ?> windowStateDescriptor;
+
 
 	/**
 	 * This is used to copy the incoming element because it can be put into several window
@@ -207,6 +212,7 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 		this.allowedLateness = allowedLateness;
 
 		setChainingStrategy(ChainingStrategy.ALWAYS);
+
 	}
 
 	private void readObject(ObjectInputStream in) throws IOException, ClassNotFoundException {
@@ -369,6 +375,62 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 					registerCleanupTimer(actualWindow);
 				}
 			}
+		} else if (windowAssigner instanceof SlidingEventTimeWindows) {
+
+			SlidingEventTimeWindows slidingEventTimeWindows = (SlidingEventTimeWindows) windowAssigner;
+			// store according to pane
+			long windowSize = ((SlidingEventTimeWindows) windowAssigner).getSize();
+			long slide = ((SlidingEventTimeWindows) windowAssigner).getSlide();
+			int paneNumer = (int)(windowSize / slide);
+			long paneStart = element.getTimestamp() - element.getTimestamp() % slide;
+			TimeWindow pane = slidingEventTimeWindows.assignPane(paneStart, paneStart + slide);
+			AppendingState<IN, ACC> paneState = getPartitionedState(
+				(W)pane, windowSerializer, windowStateDescriptor);
+			boolean isStored = false;
+			for (W window: elementWindows) {
+				// drop if the window is already late
+				if (isLate(window)){
+					continue;
+				}
+				if (!isStored) {
+					paneState.add(element.getValue());
+					isStored = true;
+				}
+
+				context.key = key;
+				context.window = window;
+
+				TriggerResult triggerResult = context.onElement(element);
+
+				if (triggerResult.isFire()) {
+					long start = window.maxTimestamp() + 1 - windowSize;
+					Collection<AppendingState<IN, ACC>> paneStatesList = new ArrayList<>(paneNumer);
+					for (int i = 0; i < paneNumer; i++) {
+						TimeWindow currentPane = slidingEventTimeWindows.assignPane(start, start + slide);
+						AppendingState<IN, ACC> currentPaneState = getPartitionedState(
+							(W)currentPane, windowSerializer, windowStateDescriptor);
+						paneStatesList.add(currentPaneState);
+						start += slide;
+					}
+					ACC contents = (ACC)mergeSlidingEventTimePaneStates(paneStatesList);
+					if (contents == null) {
+						continue;
+					}
+					fire(window, contents);
+				}
+
+				if (triggerResult.isPurge()) {
+					long cleanupStart = window.maxTimestamp() + 1 - windowSize;
+					TimeWindow cleanupPane = new TimeWindow(cleanupStart, cleanupStart + slide);
+					AppendingState<IN, ACC> cleanupState = getPartitionedState(
+						(W)cleanupPane, windowSerializer, windowStateDescriptor);
+					cleanup((W)cleanupPane, cleanupState, null);
+
+				} else {
+					registerCleanupTimer(window);
+				}
+			}
+
 		} else {
 			for (W window: elementWindows) {
 
@@ -431,25 +493,55 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 						continue;
 					}
 					windowState = getPartitionedState(stateWindow, windowSerializer, windowStateDescriptor);
-				} else {
+				} else if (windowAssigner instanceof SlidingEventTimeWindows) {
+					windowState = null;
+				}
+				else {
 					windowState = getPartitionedState(context.window, windowSerializer, windowStateDescriptor);
 				}
 
-				ACC contents = windowState.get();
-				if (contents == null) {
-					// if we have no state, there is nothing to do
-					continue;
-				}
+				if (windowAssigner instanceof SlidingEventTimeWindows) {
+					long windowSize = ((SlidingEventTimeWindows) windowAssigner).getSize();
+					long slide = ((SlidingEventTimeWindows) windowAssigner).getSlide();
+					int paneNumber = (int) (windowSize / slide);
+					long start = context.window.maxTimestamp() + 1 - windowSize;
+					TimeWindow pane = new TimeWindow(start, start + slide);
+					windowState = getPartitionedState((W)pane, windowSerializer, windowStateDescriptor);
 
-				TriggerResult triggerResult = context.onEventTime(timer.timestamp);
-				if (triggerResult.isFire()) {
-					fire(context.window, contents);
-				}
+					TriggerResult triggerResult = context.onEventTime(timer.timestamp);
+					if (triggerResult.isFire()) {
+						Collection<AppendingState<IN, ACC>> paneStateList = new ArrayList<>(paneNumber);
+						paneStateList.add(windowState);
+						start += start + slide;
+						for (int i = 1; i < paneNumber; i++) {
+							TimeWindow currentPane = new TimeWindow(start, start + slide);
+							AppendingState<IN, ACC> currentPaneState = getPartitionedState(
+								(W)currentPane, windowSerializer, windowStateDescriptor);
+							paneStateList.add(currentPaneState);
+							start += slide;
+						}
+						ACC contents = (ACC)mergeSlidingEventTimePaneStates(paneStateList);
+						fire(context.window, contents);
+						if (triggerResult.isPurge() || (windowAssigner.isEventTime() && isCleanupTime(context.window, timer.timestamp))) {
+							cleanup((W)pane, windowState, null);
+						}
+					}
+				} else {
+					ACC contents = windowState.get();
+					if (contents == null) {
+						// if we have no state, there is nothing to do
+						continue;
+					}
 
-				if (triggerResult.isPurge() || (windowAssigner.isEventTime() && isCleanupTime(context.window, timer.timestamp))) {
-					cleanup(context.window, windowState, mergingWindows);
-				}
+					TriggerResult triggerResult = context.onEventTime(timer.timestamp);
+					if (triggerResult.isFire()) {
+						fire(context.window, contents);
+					}
 
+					if (triggerResult.isPurge() || (windowAssigner.isEventTime() && isCleanupTime(context.window, timer.timestamp))) {
+						cleanup(context.window, windowState, mergingWindows);
+					}
+				}
 			} else {
 				fire = false;
 			}
@@ -516,6 +608,21 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 				fire = false;
 			}
 		} while (fire);
+	}
+
+	private Collection<IN> mergeSlidingEventTimePaneStates( Collection<AppendingState<IN, ACC>> collection) {
+		try {
+			List<IN> result = new ArrayList<>();
+			for (AppendingState<IN, ACC> state : collection) {
+				Iterable<IN> valueList = (Iterable<IN>)state.get();
+				for(IN in : valueList) {
+					result.add(in);
+				}
+			}
+			return result;
+		} catch (Exception e) {
+			throw new RuntimeException("Error while reading slidingEventTimeWindow State", e);
+		}
 	}
 
 	/**

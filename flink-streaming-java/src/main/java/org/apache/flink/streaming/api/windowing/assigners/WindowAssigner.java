@@ -56,6 +56,10 @@ public abstract class WindowAssigner<T, W extends Window> implements Serializabl
 	 */
 	public abstract Collection<W> assignWindows(T element, long timestamp, WindowAssignerContext context);
 
+	public W assignPane(long start, long end) {
+		return null;
+	}
+
 	/**
 	 * Returns the default trigger associated with this {@code WindowAssigner}.
 	 */
