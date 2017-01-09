@@ -512,7 +512,7 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 					if (triggerResult.isFire()) {
 						Collection<AppendingState<IN, ACC>> paneStateList = new ArrayList<>(paneNumber);
 						paneStateList.add(windowState);
-						start += start + slide;
+						start += slide;
 						for (int i = 1; i < paneNumber; i++) {
 							TimeWindow currentPane = new TimeWindow(start, start + slide);
 							AppendingState<IN, ACC> currentPaneState = getPartitionedState(
