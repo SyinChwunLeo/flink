@@ -522,9 +522,9 @@ public class WindowOperator<K, IN, ACC, OUT, W extends Window>
 						}
 						ACC contents = (ACC)mergeSlidingEventTimePaneStates(paneStateList);
 						fire(context.window, contents);
-						if (triggerResult.isPurge() || (windowAssigner.isEventTime() && isCleanupTime(context.window, timer.timestamp))) {
+					}
+					if (triggerResult.isPurge() || (windowAssigner.isEventTime() && isCleanupTime(context.window, timer.timestamp))) {
 							cleanup((W)pane, windowState, null);
-						}
 					}
 				} else {
 					ACC contents = windowState.get();
